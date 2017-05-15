@@ -1,0 +1,349 @@
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <fstream>
+#include <exception>
+#include <string>
+#include <cstring>
+#include <iostream>
+
+#include "BufferFrame.hpp"
+#include "BufferManager.hpp"
+
+using namespace std;
+
+
+BufferManager::BufferManager(unsigned pageCount) : _pageCount(pageCount) {
+
+}
+
+BufferFrame& BufferManager::fixPage(uint64_t pageId, bool exclusive) {
+
+	this->m.lock();
+
+	cout << "fix page" << pageId << endl;
+	try {
+		BufferFrame* f = frames.at(pageId);
+		if(exclusive){
+			if(!pthread_rwlock_trywrlock(&(f->_latch))){
+				//frame already in use!!
+				this->m.unlock();
+				throw 0;
+			}
+		}else{
+			if(!pthread_rwlock_tryrdlock(&(f->_latch))){
+				//frame already in use!!
+				this->m.unlock();
+				throw 0;
+			}
+		}
+		cout << "page already in ht" << endl;
+		this->m.unlock();
+		return *f;
+
+	} catch (const std::out_of_range& e) {
+
+		cout << "not in ht" << endl;
+
+		/* page not found in hashtable *
+		 * load page from filesystem   */
+
+		if (unfixed_pages.empty() && frames.size() == _pageCount){
+
+			/* well, all pages in use, so no way to load another one */
+			throw invalid_argument("too many used pages");
+
+		}
+
+
+		cout << "frames.size:" <<  frames.size() << " pagecount: " << _pageCount << endl;
+		if (frames.size() >= _pageCount)
+		{
+			/* not enough space in memory, kill an unused page 	*
+			 * we are implementing LRU here 					*/
+
+
+			BufferFrame* delete_page = unfixed_pages.front();
+			unfixed_pages.pop_front();
+
+			if (delete_page->state != CLEAN)
+			{
+				cout << "write back" << endl;
+				write_back(delete_page->getData(),delete_page->getPageId());
+			}
+
+			cout << "page written back" << endl;
+
+			cout << delete_page->getPageId() << endl;
+
+			//delete delete_page;
+
+			cout << "page deleted" << endl;
+
+		}
+
+		cout << "now load frame" << endl;
+
+		BufferFrame* f = load_frame(pageId);
+
+		frames[pageId] = f;//We assured, that it doesn't already exists
+
+		if(exclusive){
+			if(!pthread_rwlock_trywrlock(&(f->_latch))){
+				//frame already in use!!
+				this->m.unlock();
+				throw 0;
+			}
+		}else{
+			if(!pthread_rwlock_tryrdlock(&(f->_latch))){
+				//frame already in use!!
+				this->m.unlock();
+				throw 0;
+			}
+		}
+
+		this->m.unlock();
+		return *f;
+	}
+
+
+
+}
+
+void  BufferManager::unfixPage(BufferFrame& frame, bool isDirty) {
+
+	this->m.lock();
+
+	if (frame.state != CREATED && isDirty)
+		frame.state = DIRTY;
+
+	unfixed_pages.push_back(&frame);
+	
+	pthread_rwlock_unlock(&frame._latch);
+
+	this->m.unlock();
+	cout << "unfixed page: " << frame.getPageId() << endl;
+
+}
+
+
+BufferManager::open_seg_t* BufferManager::open_segment(uint64_t seg_no)
+{
+	uint64_t* info_data;
+	uint64_t info_file_size;
+
+	open_seg_t* seg = new open_seg_t();
+	seg->info = new open_seg_info_t();
+
+	seg->info->file_name += FILESYSTEM;
+	seg->info->file_name += "seg_info";
+	seg->info->file_name += std::to_string(seg_no);
+
+	seg->file_name += FILESYSTEM;
+	seg->file_name += "seg";
+	seg->file_name += std::to_string(seg_no);
+
+	seg->size = file_size(seg->file_name)/PAGE_SIZE;
+	info_file_size = file_size(seg->info->file_name)/sizeof(uint64_t);
+
+	if(seg->size*2 != info_file_size) //*2 -> (page_no,page_pos) per page ind page safed in page_structure
+		throw invalid_argument("fatal error, segment index structure does not match segment file (corrupt files?)");
+
+
+	if ((seg->info->fd = open(seg->info->file_name.c_str(),  O_CREAT |  O_RDWR, S_IRUSR|S_IWUSR)) < 0) {
+		std::cerr << "cannot open file '" << seg->info->file_name << "': " << strerror(errno) << std::endl;
+		throw invalid_argument("error creating/accessing segment info file");
+	}
+
+
+
+	info_data = (uint64_t*) mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, seg->info->fd, 0);
+
+	/*read segment hashtable from file*/
+	for (uint64_t i = 0; i < seg->size; ++i) {
+		seg->info->structure[info_data[i*2]] = info_data[i*2+1];
+	}
+
+	if ((seg->fd = open(seg->file_name.c_str(),  O_CREAT |  O_RDWR, S_IRUSR|S_IWUSR)) < 0) {
+		std::cerr << "cannot open file '" << seg->file_name << "': " << strerror(errno) << std::endl;
+		throw invalid_argument("error creating/accessing segment file");
+	}
+
+	seg->data = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, seg->fd, 0);
+
+	munmap(info_data, file_size(seg->info->file_name));
+
+	return seg;
+
+}
+
+void BufferManager::close_segment(BufferManager::open_seg_t* seg)
+{
+	close(seg->fd);
+	close(seg->info->fd);
+}
+
+
+uint64_t BufferManager::file_size(string file_name)
+{
+	struct stat stat_buf;
+	int rc = stat(file_name.c_str(), &stat_buf);
+	return rc == 0 ? stat_buf.st_size : 0;
+}
+
+void BufferManager::write_back(void* data, uint64_t pageId)
+{
+	uint64_t seg_no = (pageId >> 48);  		 		// segment number is the first 16 bit
+	uint64_t page_no = (pageId ^ (seg_no << 48)); 	// pageId the last 48 bit
+
+	open_seg_t* seg;
+
+	/*	if segement opened, get segment pointer		*/
+	/*	otherwise, open segment 					*/
+
+	try
+	{
+		seg = this->open_segments.at(seg_no); //this guy throws the exception
+	}
+	catch(const std::out_of_range& e)
+	{
+		seg = open_segment(seg_no);
+		open_segments[seg_no] = seg;
+	}
+
+	uint64_t page_pos;
+
+	/* finds actual position of page in segment */
+	/* if not available, create page 			*/
+
+	try
+	{
+		//this means actually page is DIRTY
+		page_pos = seg->info->structure.at(page_no);
+
+		munmap(seg->data, seg->size*PAGE_SIZE);
+	}
+	catch(const std::out_of_range& e)
+	{
+		//this means actually page is CREATED
+
+		page_pos = seg->size;
+
+		munmap(seg->data, seg->size*PAGE_SIZE);
+
+		seg->info->structure[page_no] = page_pos;
+
+		lseek(seg->info->fd,0,SEEK_END);
+
+
+		if (write(seg->info->fd, &page_no, sizeof(uint64_t)) < 0)
+		{
+			std::cerr << "cannot write to file '" << seg->info->file_name << "': " << strerror(errno) << std::endl;
+			throw runtime_error("error writing to segment info file");
+		}
+
+		if (write(seg->info->fd, &page_pos, sizeof(uint64_t)) < 0)
+		{
+			std::cerr << "cannot write to file '" << seg->info->file_name << "': " << strerror(errno) << std::endl;
+			throw runtime_error("error writing to segment info file");
+		}
+
+
+		seg->size++;
+
+	}
+
+	lseek(seg->fd,page_pos*PAGE_SIZE,SEEK_SET);
+	if (write(seg->fd, data, PAGE_SIZE) < 0) { //well this should really be done multi threaded, but also works like this
+		std::cerr << "cannot write to file '" << seg->file_name << "': " << strerror(errno) << std::endl;
+		throw runtime_error("error writing page to segment");
+	}
+
+	/* segment changed 		*/
+	/* needs to re-mmap page*/
+
+	seg->data = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, seg->fd, 0);
+
+}
+
+BufferFrame* BufferManager::load_frame(uint64_t pageId)
+{
+	uint64_t seg_no = (pageId >> 48);  		 		// segment number is the first 16 bit
+	uint64_t page_no = (pageId ^ (seg_no << 48)); 	// pageId the last 48 bit
+
+	open_seg_t* seg;
+
+	/*	if segement opened, get segment pointer		*/
+	/*	otherwise, open segment 					*/
+
+	try
+	{
+		seg = this->open_segments.at(seg_no); //this guy throws the exception
+	}
+	catch(const std::out_of_range& e)
+	{
+		seg = open_segment(seg_no);
+		open_segments[seg_no] = seg;
+	}
+
+	cout << "segment open" << endl;
+
+	/* finds actual position of page in segment			*/
+	/* if not available, create page virtually!!		*/
+	/* write_back, creates actual seg structure later	*/
+
+
+	void* data = malloc(PAGE_SIZE);
+	BufferFrame* f =  new BufferFrame(data,pageId);
+
+	cout << "new Bufferframe created" << endl;
+
+	try
+	{
+		uint64_t page_pos = seg->info->structure.at(page_no);
+		std::memcpy(data,((uint8_t*)seg->data)+page_pos,(size_t)PAGE_SIZE); //copy data from disk, this can be done possibly better with some multi threading and memory breakpoints
+
+		f->state = CLEAN;
+
+	}
+	catch(const std::out_of_range& e)
+	{
+		f->state = CREATED;
+	}
+
+	cout << "frame loaded" << endl;
+
+	return f;
+
+}
+
+
+BufferManager::~BufferManager() {
+
+	while(!unfixed_pages.empty())
+	{
+		BufferFrame* delete_page = unfixed_pages.front();
+		unfixed_pages.pop_front();
+
+		if (delete_page->state != CLEAN)
+		{
+			write_back(delete_page->getData(),delete_page->getPageId());
+		}
+
+		//delete delete_page;
+	}
+	for ( unsigned i = 0; i < frames.bucket_count(); ++i) {
+		for (auto it = frames.begin(); it != frames.end(); ++it) {
+			write_back(it->second->getData(),it->second->getPageId());
+		}
+	}
+	for ( unsigned i = 0; i < open_segments.bucket_count(); ++i) {
+		for ( auto it = open_segments.begin(); it != open_segments.end(); ++it )
+			close_segment(it->second);
+	}
+}

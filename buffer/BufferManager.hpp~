@@ -1,0 +1,64 @@
+
+
+#ifndef _BUFFERMANAGER_H_
+#define _BUFFERMANAGER_H_
+
+#define FILESYSTEM "DATABASE/"
+
+#include <list>
+#include <inttypes.h>
+#include <unordered_map>
+#include <map>
+#include "BufferFrame.hpp"
+#include <mutex>
+
+using namespace std;
+
+
+class BufferManager {
+
+public:
+
+	BufferManager(unsigned pageCount);
+
+	BufferFrame& fixPage(uint64_t pageId, bool exclusive); //keep in memory (somehow)
+	void  unfixPage(BufferFrame& frame, bool isDirty);
+
+	~BufferManager();
+
+private:
+
+	typedef struct{
+		int 				fd;
+		string				file_name;
+		std::unordered_map<uint64_t, uint64_t> structure; //"pointer in segement to page" relation
+	} open_seg_info_t;
+
+	typedef struct {
+		int 				fd;
+		string 				file_name;
+		uint64_t 			size;
+		void* 				data;
+		open_seg_info_t*	info;
+	} open_seg_t;
+
+	uint64_t 										_pageCount;
+	std::unordered_map<uint64_t, BufferFrame*> 		frames;
+	std::list<BufferFrame*>							unfixed_pages;
+	std::unordered_map<uint64_t, open_seg_t*>		open_segments;
+	mutex m;
+
+	open_seg_t* open_segment(uint64_t seg_no);
+
+	uint64_t file_size(string file_name);
+
+	void close_segment(open_seg_t* seg);
+
+	void write_back(void* data, uint64_t pageId);
+
+	BufferFrame* load_frame(uint64_t pageId);
+
+};
+
+
+#endif /* _BUFFERMANAGER_H_ */
