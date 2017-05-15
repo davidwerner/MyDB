@@ -1,4 +1,4 @@
-BUILD:=./build
+BUILD:=/build
 BUFFER:=./buffer
 TEST:=./testing
 CXX:=g++
